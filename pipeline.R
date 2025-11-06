@@ -22,6 +22,8 @@ str(raw)
 head(raw)
 sort(unique(raw$Metric))
 
+# --- Preprocessing ---
+
 # Data cleaning
 clean <- raw |>
   
@@ -37,6 +39,12 @@ clean <- raw |>
         Grouper == "RESIDENT + FELLOW" ~ "Resident/Fellow",
         TRUE ~ Grouper
       )),
+    
+    group = if_else(
+      type == "Resident/Fellow",
+      "Trainee",
+      "Staff"
+    ),
     
     # fix typo
     metric = str_replace(Metric, "Recieved", "Received")) |>
@@ -55,28 +63,31 @@ clean <- raw |>
   # clean names
   clean_names() |>
   
-  # derive variables
+  # sort, rename and derive variables
   transmute(
     
-    id, type,
+    # identifiers
+    id, type, group,
     
+    # time periods
     month = ym(month),
-    
     obs_days = count_of_days_in_reporting_period,
     obs_weeks = obs_days / 7,
     
+    # scheduled work
     apt_n = count_of_appointments,
-    
     sch_days = count_of_scheduled_days,
     sch_hpd = scheduled_hours_per_day,
     sch_hrs = sch_days * sch_hpd,
 
+    # after-hours
     ah_ost = count_of_minutes_active_outside_scheduled_time_30_min_buffer / 60,
     ah_oud = count_of_minutes_active_on_unscheduled_days / 60,
     ah_7t7 = count_of_minutes_active_outside_7am_to_7pm / 60,
     ah_sat = count_of_saturday_minutes / 60,
     ah_sun = count_of_sunday_minutes / 60,
     
+    # system usage
     sys_days = count_of_days_in_system,
     sys_days_wah = count_of_days_of_afterhours_activity,
     sys_days_wbh = sys_days - sys_days_wah,
@@ -84,17 +95,20 @@ clean <- raw |>
     sys_aft_hrs = ah_ost + ah_7t7 + ah_oud + ah_sat + ah_sun,
     sys_ib_hrs = count_of_in_basket_minutes / 60,
     
+    # received messages (msg)
     msg_mar = count_of_patient_medical_advice_requests_messages_received,
     msg_pcm = count_of_patient_call_messages_received,
     msg_res = count_of_result_messages_received,
     msg_rxa = count_of_rx_auth_messages_received,
     msg_all = msg_mar + msg_pcm + msg_res + msg_rxa,
     
+    # incomplete (inc) messages
     msg_mar_inc = count_of_patient_medical_advice_requests_messages_incomplete,
     msg_pcm_inc = count_of_patient_call_messages_incomplete,
     msg_res_inc = count_of_result_messages_incomplete,
     msg_all_inc = msg_mar_inc + msg_pcm_inc + msg_res_inc,
     
+    # days to completion (dtc)
     msg_mar_dtc =
       average_days_until_patient_medical_advice_request_message_marked_done,
     msg_pcm_dtc = average_days_until_patient_call_messages_marked_done,
@@ -102,23 +116,44 @@ clean <- raw |>
     msg_rxa_dtc = average_days_until_rx_auth_message_marked_done,
     msg_all_dtc = (msg_mar_dtc + msg_pcm_dtc + msg_res_dtc + msg_rxa_dtc) / 4,
     
+    # completion rates
+    msg_mar_crt = 1 - (msg_mar_inc / msg_mar),
+    msg_pcm_crt = 1 - (msg_pcm_inc / msg_pcm),
+    msg_res_crt = 1 - (msg_res_inc / msg_res),
+    msg_all_crt = 1 - (msg_all_inc / (msg_mar + msg_pcm + msg_res)),
+    
+    # minutes per appointment (mpa)
     mpa_cr = minutes_in_clinical_review_per_appointment,
     mpa_nl = minutes_in_notes_letters_per_appointment,
     mpa_od = minutes_in_orders_per_appointment,
     mpa_ib = minutes_in_in_basket_per_appointment,
     mpa_all = mpa_cr + mpa_nl + mpa_od + mpa_ib,
     
+    # minutes per day (mpd)
     mpd_cr = minutes_in_clinical_review_per_day,
     mpd_ib = minutes_in_in_basket_per_day,
     mpd_ot = minutes_in_other_per_day,
-    mpd_all = mpd_cr + mpd_ib + mpd_ot
+    mpd_all = mpd_cr + mpd_ib + mpd_ot,
+    
+    # per-schedule hour (psh) rates
+    psh_sys_hrs = sys_hrs / sch_hrs,
+    psh_sys_aft_hrs = sys_aft_hrs / sch_hrs,
+    psh_sys_ib_hrs = sys_ib_hrs / sch_hrs,
+    psh_msg_mar = msg_mar / sch_hrs,
+    psh_msg_pcm = msg_pcm / sch_hrs,
+    psh_msg_res = msg_res / sch_hrs,
+    psh_msg_rxa = msg_rxa / sch_hrs,
+    psh_msg_all = msg_all / sch_hrs,
     
   ) |>
   
   # remove NA rows
   filter(!is.na(sch_days))
 
-totals <- clean |>
+# --- Derive intermediate datasets ---
+
+# Monthly totals
+monthly <- clean |>
   group_by(month) |>
   summarise(
     prv_n = n_distinct(id),
@@ -126,25 +161,17 @@ totals <- clean |>
     bsn_days = max(sch_days, na.rm = TRUE),
     bsn_hrs = max(sch_hrs, na.rm = TRUE))
 
-fte <- clean |>
+# Effort calculation
+effort <- clean |>
   group_by(id) |>
   summarise(
-    te = mean(sch_hrs, na.rm = TRUE) / mean(totals$bsn_hrs, na.rm = TRUE),
-    fte = factor(case_when(
-      te >= 0.8 ~ ".8+ FTE",
-      te >= 0.6 ~ ".6-.8 FTE",
-      te >= 0.4 ~ ".4-.6 FTE",
-      te >= 0.3 ~ ".3-.4 FTE",
-      te >= 0.2 ~ ".2-.3 FTE",
-      te >= 0.1 ~ ".1-.2 FTE",
-      TRUE ~ "<.1 FTE"
-    ),
-    levels = c("<.1 FTE", ".1-.2 FTE", ".2-.3 FTE",
-               ".3-.4 FTE", ".4-.6 FTE", ".6-.8 FTE", ".8+ FTE")))
+    fte = sch_hrs / ,
+  )
 
+# Merge into full dataset
 full <- clean |>
   left_join(
-    totals |> select(month, prv_n, bsn_days),
+    monthly |> select(month, prv_n, bsn_days),
     by = "month") |>
   left_join(
     fte,
@@ -174,7 +201,7 @@ prv <- full |>
     cv = sd / mean * 100)) |>
   rename(metric = type)
 
-days <- totals |>
+days <- monthly |>
   summarise(
     across(
       c(bsn_days, obs_days),
@@ -401,37 +428,63 @@ tbl1 <- rbind(prv, days, sch, sys, hrs, mpa, mpd, msg, inc, dtc) |>
     across(everything(), ~ str_replace_all(.x, "\\(NA\\)", "(—)"))
   )
 
-# Table 2: ib_hrs by fte with p val
-tbl2 <- full |>
-  group_by(id, fte) |>
+# Figure 1
+fig1_df <- full |> group_by(month) |>
   summarise(
-    total_sys_ib_hrs = sum(sys_ib_hrs, na.rm = TRUE),
-    total_sch_days = sum(sch_days, na.rm = TRUE),
-    sys_ib_hrs_per_sch_week = total_sys_ib_hrs / total_sch_days * 5
-  ) |>
-  group_by(fte) |>
-  summarise(
-    n = n(),
-    mean_sys_ib_hrs_per_sch_week = mean(sys_ib_hrs_per_sch_week, na.rm = TRUE),
-    sd_sys_ib_hrs_per_sch_week = sd(sys_ib_hrs_per_sch_week, na.rm = TRUE),
-    median_sys_ib_hrs_per_sch_week = median(sys_ib_hrs_per_sch_week, na.rm = TRUE),
-    iqr_sys_ib_hrs_per_sch_week = IQR(sys_ib_hrs_per_sch_week, na.rm = TRUE)
-  ) |>
-  ungroup()
+    sch_hrs = sum(sch_hrs, na.rm = TRUE),
+    apt_n = sum(apt_n, na.rm = TRUE),
+    sys_hrs = sum(sys_hrs, na.rm = TRUE),
+    sys_aft_hrs = sum(sys_aft_hrs, na.rm = TRUE),
+    sys_ib_hrs = sum(sys_ib_hrs, na.rm = TRUE),
+    msg_mar = sum(msg_mar, na.rm = TRUE),
+    msg_pcm = sum(msg_pcm, na.rm = TRUE),
+    msg_res = sum(msg_res, na.rm = TRUE),
+    msg_rxa = sum(msg_rxa, na.rm = TRUE),
+    msg_all = sum(msg_all, na.rm = TRUE),
+    msg_mar_inc = sum(msg_mar_inc, na.rm = TRUE),
+    msg_pcm_inc = sum(msg_pcm_inc, na.rm = TRUE),
+    msg_res_inc = sum(msg_res_inc, na.rm = TRUE),
+    msg_all_inc = sum(msg_all_inc, na.rm = TRUE),
+    prov_n = n_distinct(id),
+    bsn_days = max(sch_days, na.rm = TRUE)
+  )
 
-# Subfigures
-fig1.1 <- ggplot(
-  full |> group_by(month) |> summarise(sch_hrs = sum(sch_hrs, na.rm = TRUE),
-                                       apt_n = sum(apt_n, na.rm = TRUE),
-                                       prov_n = n_distinct(id),
-                                       bsn_days = max(sch_days, na.rm = TRUE)),
+fig1_long <- fig1_df |>
+  transmute(
+    month,
+    `Active Providers` = prov_n / max(prov_n, na.rm = TRUE) * 100,
+    `Business Days`    = bsn_days / max(bsn_days, na.rm = TRUE) * 100,
+    `Scheduled Hours`  = sch_hrs / max(sch_hrs, na.rm = TRUE) * 100
+  ) |>
+  pivot_longer(-month, names_to = "metric", values_to = "pct")
+
+
+# Sub-figures
+# Clustered barchart per month of Active Providers, Business days and Scheduled Hours (one bar per variable, expressed as a percentage of max value)
+
+fig1.0 <- ggplot(fig1_long,
+  aes(x = month, y = pct, fill = metric)) +
+  geom_col(position = position_dodge(width = 25), alpha = 0.5) +
+  scale_x_date(
+    breaks = c(min(fig1_long$month), max(fig1_long$month)),
+    minor_breaks = seq(min(fig1_long$month), max(fig1_long$month), by = "1 month"),
+    date_labels = "%b %Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    name = "",
+    labels = NULL,
+    minor_breaks = seq(0, 100, by = 5)
+  ) +
+  labs(
+    fill = "",
+  ) +
+  theme_minimal()
+
+fig1.1 <- ggplot(fig1_df,
   aes(x = month)) +
   geom_line(aes(y = cumsum(sch_hrs), color = "Scheduled Hours")) +
   geom_line(aes(y = cumsum(apt_n), color = "Appointments")) +
-  geom_bar(aes(y = prov_n * 500, fill = "Active Providers"), stat = "identity",
-           alpha = 0.1) +
-  geom_bar(aes(y = bsn_days * 500, fill = "Business Days"), stat = "identity",
-           alpha = 0.1, position = position_dodge(width = 0.9)) +
   scale_x_date(
     breaks = c(min(full$month), max(full$month)),
     minor_breaks = seq(min(full$month), max(full$month), by = "1 month"),
@@ -443,18 +496,13 @@ fig1.1 <- ggplot(
     minor_breaks = seq(0, 300000, by = 1000)
   ) +
   labs(
-    title = "Visible Workload Distribution Over Time",
+    title = "Scheduled Work",
     x = "Month",
     color = "Cummulative Counts",
-    fill = "Monthly Count"
   ) +
   theme_minimal()
 
-fig1.2 <- ggplot(
-  full |> group_by(month) |>
-    summarise(sys_hrs = sum(sys_hrs, na.rm = TRUE),
-              sys_aft_hrs = sum(sys_aft_hrs, na.rm = TRUE),
-              sys_ib_hrs = sum(sys_ib_hrs, na.rm = TRUE)),
+fig1.2 <- ggplot(fig1_df,
   aes(x = month)) +
   geom_line(aes(y = cumsum(sys_hrs), color = "System Hours")) +
   geom_line(aes(y = cumsum(sys_aft_hrs), color = "After-Hours")) +
@@ -466,8 +514,7 @@ fig1.2 <- ggplot(
     expand = c(0.01, 0)
   ) +
   scale_y_continuous(
-    name = NULL,
-    minor_breaks = seq(0, 300000, by = 1000)
+    name = NULL
   ) +
   labs(
     title = "System Time",
@@ -476,12 +523,7 @@ fig1.2 <- ggplot(
   ) +
   theme_minimal()
 
-fig1.3 <- ggplot(
-  full |> group_by(month) |> summarise(msg_mar = sum(msg_mar, na.rm = TRUE),
-                                       msg_pcm = sum(msg_pcm, na.rm = TRUE),
-                                       msg_res = sum(msg_res, na.rm = TRUE),
-                                       msg_rxa = sum(msg_rxa, na.rm = TRUE),
-                                       msg_all = sum(msg_all, na.rm = TRUE)),
+fig1.3 <- ggplot(fig1_df,
   aes(x = month)) +
   geom_line(aes(y = cumsum(msg_mar), color = "Medical Advice Request")) +
   geom_line(aes(y = cumsum(msg_pcm), color = "Patient Call")) +
@@ -505,12 +547,7 @@ fig1.3 <- ggplot(
     ) +
     theme_minimal()
 
-fig1.4 <- ggplot(
-  full |> group_by(month) |>
-    summarise(msg_mar_inc = sum(msg_mar_inc, na.rm = TRUE),
-              msg_pcm_inc = sum(msg_pcm_inc, na.rm = TRUE),
-              msg_res_inc = sum(msg_res_inc, na.rm = TRUE),
-              msg_all_inc = sum(msg_all_inc, na.rm = TRUE)),
+fig1.4 <- ggplot(fig1_df,
   aes(x = month)) +
   geom_line(aes(y = cumsum(msg_mar_inc), color = "Medical Advice Request")) +
   geom_line(aes(y = cumsum(msg_pcm_inc), color = "Patient Call")) +
@@ -577,8 +614,7 @@ fig2 <- ggplot(
 
 
 # Fig 3
-lorenz_data <- full |>
-  group_by(sys_ib_hrs) |>
+lorenz_data <- full |> group_by(sys_ib_hrs) |>
   summarise(sys_ib_hrs = sum(sys_ib_hrs, na.rm = TRUE)) |>
   arrange(sys_ib_hrs) |>
   mutate(
@@ -645,10 +681,10 @@ fig4 <- ggplot(
   theme_minimal()
 
 # Fig 5
-cor_matrix <- full |>
-  select(sys_ib_hrs, sys_aft_hrs, msg_mar, msg_all, 
-         msg_mar_inc, msg_all_inc, msg_mar_dtc, msg_all_dtc) |>
-  cor(use = "pairwise.complete.obs")
+# cor_matrix for all numeric variables
+cor_matrix <- cor(full |> select(where(is.numeric)) |> drop_na(),
+                  use = "pairwise.complete.obs")
+
 cor_melt <- as.data.frame(as.table(cor_matrix))
 fig5 <- ggplot(cor_melt, aes(Var1, Var2, fill = Freq)) +
   geom_tile() +
@@ -658,6 +694,20 @@ fig5 <- ggplot(cor_melt, aes(Var1, Var2, fill = Freq)) +
   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
   coord_fixed() +
   labs(title = "Correlation Matrix Heatmap")
+
+# Fig 6: Boxplots by FTE
+fig6 <- ggplot(
+  full,
+  aes(x = fte_4tile, y = rt_ib_hr_per_sch_hr, fill = fte_4tile)
+) +
+  geom_boxplot() +
+  labs(
+    title = "In-Basket Hours by FTE",
+    x = "FTE",
+    y = "In-Basket Hours",
+    fill = "FTE"
+  ) +
+  theme_minimal()
 
 # --- Save outputs ---
 
